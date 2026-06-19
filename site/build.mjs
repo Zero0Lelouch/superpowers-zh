@@ -9,6 +9,7 @@ import {
 } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { renderMarkdown } from './md.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -545,8 +546,47 @@ function build() {
     }));
   }
 
-  // Cloudflare Pages 缓存策略：静态资源长缓存，HTML 不缓存
+  // 收集所有生成页面里的内联 <script> 内容，算 SHA-256 作为 CSP hash 白名单。
+  // 本站脚本由本生成器产出（可信），用 hash 即可严格禁用 'unsafe-inline'/'unsafe-eval'
+  // 而不误伤自有内联脚本——注入的外来脚本则被 CSP 拦截。
+  const scriptHashes = new Set();
+  const collectScriptHashes = (dir) => {
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, ent.name);
+      if (ent.isDirectory()) { collectScriptHashes(p); continue; }
+      if (!ent.name.endsWith('.html')) continue;
+      const html = readFileSync(p, 'utf8');
+      for (const m of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+        scriptHashes.add("'sha256-" + createHash('sha256').update(m[1], 'utf8').digest('base64') + "'");
+      }
+    }
+  };
+  collectScriptHashes(DIST);
+
+  // 严格 CSP：脚本仅允许 'self' + 本站内联脚本的 hash；样式仅 'self'（无内联样式）；
+  // 禁用插件/内联事件；锁死 base-uri 与 frame 祖先（防点击劫持）。外链均为 <a> 导航，不受影响。
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' " + [...scriptHashes].join(' '),
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+  ].join('; ');
+
+  // Cloudflare Pages：全站安全响应头（/*）+ 缓存策略（静态资源长缓存，HTML 不缓存）
   writeFileSync(join(DIST, '_headers'),
+    '/*\n' +
+    '  Content-Security-Policy: ' + csp + '\n' +
+    '  X-Content-Type-Options: nosniff\n' +
+    '  X-Frame-Options: DENY\n' +
+    '  Referrer-Policy: no-referrer\n' +
+    '  Cross-Origin-Opener-Policy: same-origin\n' +
+    '  Permissions-Policy: geolocation=(), microphone=(), camera=()\n' +
     '/assets/*\n  Cache-Control: public, max-age=31536000, immutable\n' +
     '/styles.css\n  Cache-Control: public, max-age=86400\n' +
     '/app.js\n  Cache-Control: public, max-age=86400\n' +
